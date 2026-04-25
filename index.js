@@ -66,19 +66,23 @@ function authHeader() {
 async function getSessions(status) {
   try {
     const res = await fetch(`${WORKER}/chat/sessions?status=${status}&limit=40`, { headers: authHeader() });
-    if (!res.ok) return [];
+    console.log('[getSessions] status:', res.status);
+    if (!res.ok) { console.log('[getSessions] bad status, body:', await res.text()); return []; }
     const data = await res.json();
+    console.log('[getSessions] raw data:', JSON.stringify(data).slice(0, 300));
     return data.sessions || [];
-  } catch { return []; }
+  } catch (e) { console.error('[getSessions] error:', e.message); return []; }
 }
 
 async function getQueue() {
   try {
     const res = await fetch(`${WORKER}/chat/queue`, { headers: authHeader() });
-    if (!res.ok) return [];
+    console.log('[getQueue] status:', res.status);
+    if (!res.ok) { console.log('[getQueue] bad status, body:', await res.text()); return []; }
     const data = await res.json();
+    console.log('[getQueue] raw data:', JSON.stringify(data).slice(0, 300));
     return data.queue || [];
-  } catch { return []; }
+  } catch (e) { console.error('[getQueue] error:', e.message); return []; }
 }
 
 async function getMessages(chatId, since) {
@@ -260,9 +264,9 @@ function initPusher() {
 
   const adminCh = pusher.subscribe('xtero-admin');
 
-  adminCh.bind('new-session',     () => refreshSessions(pusher));
+  adminCh.bind('new-session',     (data) => { console.log('[Pusher] new-session event:', JSON.stringify(data)); refreshSessions(pusher); });
   adminCh.bind('session-updated', () => refreshSessions(pusher));
-  adminCh.bind('queue-updated',   () => refreshSessions(pusher));
+  adminCh.bind('queue-updated',   (data) => { console.log('[Pusher] queue-updated event:', JSON.stringify(data)); refreshSessions(pusher); });
 
   // User started typing → show a placeholder in the Discord channel
   adminCh.bind('user-typing', async (data) => {
@@ -305,12 +309,15 @@ function initPusher() {
 // ── Refresh sessions ───────────────────────────────────────────────────────────
 
 async function refreshSessions(pusher) {
+  console.log('[refreshSessions] called');
   const [queued, open] = await Promise.all([getQueue(), getSessions('open')]);
+  console.log('[refreshSessions] queued:', queued.length, 'open:', open.length);
   const all = [...queued, ...open];
 
   for (const session of all) {
     const chatId = resolveId(session);
-    if (!chatId || storeHas(chatId)) continue;
+    console.log('[refreshSessions] session:', JSON.stringify(session).slice(0, 150), '→ chatId:', chatId);
+    if (!chatId || storeHas(chatId)) { console.log('[refreshSessions] skipping', chatId, 'storeHas:', storeHas(chatId)); continue; }
 
     const channel = await getOrCreateChannel(chatId, session.username || 'Unknown', pusher);
     if (!channel) continue;
