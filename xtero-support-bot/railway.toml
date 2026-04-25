@@ -1,6 +1,7 @@
 [build]
-builder = "dockerfile"
+buildCommand = "npm install"
 
 [deploy]
+startCommand = "node index.js"
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 5
