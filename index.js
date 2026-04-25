@@ -1,7 +1,5 @@
 require('dotenv/config');
 const { Client, GatewayIntentBits, ChannelType, Partials } = require('discord.js');
-// Ensure pusher-js works in Node (it needs a global WebSocket)
-if (!global.WebSocket) global.WebSocket = require('ws');
 const Pusher = require('pusher-js');
 
 // ── Config ─────────────────────────────────────────────────────────────────────
