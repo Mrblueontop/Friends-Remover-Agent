@@ -1,6 +1,7 @@
 require('dotenv/config');
 const { Client, GatewayIntentBits, ChannelType, Partials } = require('discord.js');
-const Pusher = require('pusher-js/node');
+const PusherLib = require('pusher-js');
+const Pusher = PusherLib.default || PusherLib;
 
 // ── Config ─────────────────────────────────────────────────────────────────────
 
