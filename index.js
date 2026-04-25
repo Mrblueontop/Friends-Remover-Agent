@@ -1,5 +1,5 @@
 require('dotenv/config');
-const { Client, GatewayIntentBits, ChannelType, Partials } = require('discord.js');
+const { Client, GatewayIntentBits, ChannelType, Partials, REST, Routes, SlashCommandBuilder, EmbedBuilder } = require('discord.js');
 const PusherLib = require('pusher-js');
 const Pusher = PusherLib.default || PusherLib;
 
@@ -388,12 +388,212 @@ client.on('typingStart', async (typing) => {
 
 // ── Ready ──────────────────────────────────────────────────────────────────────
 
+let _pusherInstance = null;
+
 client.once('ready', async () => {
   console.log(`✅  Logged in as ${client.user?.tag}`);
   const pusher = initPusher();
+  _pusherInstance = pusher;
   await recoverExistingChannels(pusher);
   await refreshSessions(pusher);
+  await registerCommands();
   console.log('🚀  Bot ready!');
+});
+
+
+// ── Slash commands ─────────────────────────────────────────────────────────────
+
+const COMMANDS = [
+  new SlashCommandBuilder()
+    .setName('refreshsessions')
+    .setDescription('Manually refresh and pick up any open/queued support sessions'),
+
+  new SlashCommandBuilder()
+    .setName('sessions')
+    .setDescription('List all active support sessions')
+    .addStringOption(opt =>
+      opt.setName('status')
+        .setDescription('Filter by status')
+        .addChoices(
+          { name: 'All', value: 'all' },
+          { name: 'Open', value: 'open' },
+          { name: 'Queued', value: 'queued' },
+          { name: 'Closed', value: 'closed' },
+        )
+    ),
+
+  new SlashCommandBuilder()
+    .setName('session')
+    .setDescription('Look up a specific support session by ID')
+    .addStringOption(opt =>
+      opt.setName('id')
+        .setDescription('The session/chat ID')
+        .setRequired(true)
+    ),
+
+  new SlashCommandBuilder()
+    .setName('close')
+    .setDescription('Close the support session linked to this channel'),
+
+  new SlashCommandBuilder()
+    .setName('queue')
+    .setDescription('Show the current live support queue'),
+
+  new SlashCommandBuilder()
+    .setName('status')
+    .setDescription('Show bot status — Pusher connection, active sessions, etc.'),
+].map(cmd => cmd.toJSON());
+
+async function registerCommands() {
+  const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
+  try {
+    await rest.put(Routes.applicationGuildCommands(client.user.id, GUILD_ID), { body: COMMANDS });
+    console.log('✅  Slash commands registered');
+  } catch (e) {
+    console.error('❌  Failed to register slash commands:', e);
+  }
+}
+
+client.on('interactionCreate', async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+
+  const { commandName } = interaction;
+
+  // ── /refreshsessions ────────────────────────────────────────────────────────
+  if (commandName === 'refreshsessions') {
+    await interaction.deferReply();
+    const before = byChatId.size;
+    await refreshSessions(_pusherInstance);
+    const after = byChatId.size;
+    const newCount = after - before;
+    await interaction.editReply(
+      newCount > 0
+        ? `✅ Refreshed — picked up **${newCount}** new session(s). Total active: **${after}**`
+        : `✅ Refreshed — no new sessions found. Active: **${after}**`
+    );
+    return;
+  }
+
+  // ── /sessions ────────────────────────────────────────────────────────────────
+  if (commandName === 'sessions') {
+    await interaction.deferReply();
+    const status = interaction.options.getString('status') || 'all';
+    const sessions = await getSessions(status);
+    const queue    = await getQueue();
+
+    if (!sessions.length && !queue.length) {
+      await interaction.editReply(`No sessions found with status: **${status}**`);
+      return;
+    }
+
+    const all = status === 'all' ? [...queue, ...sessions] : sessions;
+    const lines = all.slice(0, 20).map(s => {
+      const id  = resolveId(s) || '?';
+      const st  = s.status || 'queued';
+      const emoji = st === 'open' ? '🟢' : st === 'queued' ? '🟡' : '🔴';
+      return `${emoji} **${s.username || 'Unknown'}** — \`${id}\` (${st})`;
+    });
+
+    const embed = new EmbedBuilder()
+      .setTitle(`Support Sessions (${all.length})`)
+      .setDescription(lines.join('\n') || 'None')
+      .setColor(0x5865F2)
+      .setTimestamp();
+
+    await interaction.editReply({ embeds: [embed] });
+    return;
+  }
+
+  // ── /session <id> ────────────────────────────────────────────────────────────
+  if (commandName === 'session') {
+    await interaction.deferReply();
+    const id = interaction.options.getString('id');
+    try {
+      const res = await fetch(`${WORKER}/chat/session/${id}`, { headers: authHeader() });
+      if (!res.ok) {
+        await interaction.editReply(`❌ Session \`${id}\` not found.`);
+        return;
+      }
+      const data    = await res.json();
+      const session = data.session || data;
+      const msgs    = data.messages || [];
+      const last    = msgs[msgs.length - 1];
+
+      const embed = new EmbedBuilder()
+        .setTitle(`Session: ${id}`)
+        .addFields(
+          { name: 'Status',   value: session.status  || 'unknown', inline: true },
+          { name: 'Username', value: session.username || 'Unknown', inline: true },
+          { name: 'Messages', value: String(msgs.length),           inline: true },
+          { name: 'Last message', value: last ? `**${last.sender}:** ${String(last.text || '').slice(0, 100)}` : 'None' },
+        )
+        .setColor(session.status === 'open' ? 0x57F287 : session.status === 'queued' ? 0xFEE75C : 0xED4245)
+        .setTimestamp(session.updatedAt ? new Date(session.updatedAt) : new Date());
+
+      await interaction.editReply({ embeds: [embed] });
+    } catch (e) {
+      await interaction.editReply(`❌ Error fetching session: ${e.message}`);
+    }
+    return;
+  }
+
+  // ── /close ────────────────────────────────────────────────────────────────────
+  if (commandName === 'close') {
+    await interaction.deferReply();
+    const session = storeGetByChannel(interaction.channelId);
+    if (!session) {
+      await interaction.editReply('❌ This channel is not linked to a support session.');
+      return;
+    }
+    const ok = await closeSession(session.chatId);
+    if (ok) {
+      await interaction.editReply('✅ Session closed.');
+      storeRemove(session.chatId);
+    } else {
+      await interaction.editReply('❌ Failed to close session — it may already be closed.');
+    }
+    return;
+  }
+
+  // ── /queue ────────────────────────────────────────────────────────────────────
+  if (commandName === 'queue') {
+    await interaction.deferReply();
+    const queue = await getQueue();
+    if (!queue.length) {
+      await interaction.editReply('📭 Queue is empty — no users waiting.');
+      return;
+    }
+    const lines = queue.map((s, i) => {
+      const id = resolveId(s) || s.sessionId || '?';
+      return `**${i + 1}.** ${s.username || 'Unknown'} — \`${id}\``;
+    });
+    const embed = new EmbedBuilder()
+      .setTitle(`🟡 Live Support Queue (${queue.length})`)
+      .setDescription(lines.join('\n'))
+      .setColor(0xFEE75C)
+      .setTimestamp();
+    await interaction.editReply({ embeds: [embed] });
+    return;
+  }
+
+  // ── /status ───────────────────────────────────────────────────────────────────
+  if (commandName === 'status') {
+    const activeSessions = byChatId.size;
+    const uptime = process.uptime();
+    const hours   = Math.floor(uptime / 3600);
+    const minutes = Math.floor((uptime % 3600) / 60);
+    const embed = new EmbedBuilder()
+      .setTitle('🤖 Bot Status')
+      .addFields(
+        { name: 'Active Sessions', value: String(activeSessions), inline: true },
+        { name: 'Uptime',          value: `${hours}h ${minutes}m`, inline: true },
+        { name: 'Guild',           value: GUILD_ID, inline: true },
+      )
+      .setColor(0x57F287)
+      .setTimestamp();
+    await interaction.reply({ embeds: [embed] });
+    return;
+  }
 });
 
 client.login(DISCORD_TOKEN).catch((e) => {
