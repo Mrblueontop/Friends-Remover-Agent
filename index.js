@@ -1,35 +1,136 @@
-// src/index.ts
-import 'dotenv/config';
-import {
-  Client,
-  GatewayIntentBits,
-  ChannelType,
-  TextChannel,
-  Partials,
-} from 'discord.js';
-// pusher-js works in Node.js 18+ via the built-in WebSocket / ws package
-import Pusher from 'pusher-js';
-import * as api from './api';
-import { SessionStore } from './sessionStore';
+require('dotenv/config');
+const { Client, GatewayIntentBits, ChannelType, Partials } = require('discord.js');
+const Pusher = require('pusher-js');
 
 // ── Config ─────────────────────────────────────────────────────────────────────
 
-const DISCORD_TOKEN  = process.env.DISCORD_TOKEN  ?? die('DISCORD_TOKEN is not set');
-const GUILD_ID       = process.env.DISCORD_GUILD_ID  ?? die('DISCORD_GUILD_ID is not set');
-const CATEGORY_ID    = process.env.DISCORD_CATEGORY_ID ?? die('DISCORD_CATEGORY_ID is not set');
-const ADMIN_TOKEN    = process.env.ADMIN_TOKEN    ?? die('ADMIN_TOKEN is not set');
-const AGENT_NAME     = process.env.AGENT_NAME     || 'Support Agent';
-const PUSHER_KEY     = process.env.PUSHER_KEY     || 'fe0cc3e34b1803ffc304';
-const PUSHER_CLUSTER = process.env.PUSHER_CLUSTER || 'us2';
+const DISCORD_TOKEN  = process.env.DISCORD_TOKEN   || die('DISCORD_TOKEN is not set');
+const GUILD_ID       = process.env.DISCORD_GUILD_ID  || die('DISCORD_GUILD_ID is not set');
+const CATEGORY_ID    = process.env.DISCORD_CATEGORY_ID || die('DISCORD_CATEGORY_ID is not set');
+const ADMIN_TOKEN    = process.env.ADMIN_TOKEN     || die('ADMIN_TOKEN is not set');
+const AGENT_NAME     = process.env.AGENT_NAME      || 'Support Agent';
+const PUSHER_KEY     = process.env.PUSHER_KEY      || 'fe0cc3e34b1803ffc304';
+const PUSHER_CLUSTER = process.env.PUSHER_CLUSTER  || 'us2';
+const WORKER         = 'https://xtero.zaggloob.workers.dev';
 
-function die(msg: string): never {
-  console.error(`❌  ${msg}`);
+function die(msg) {
+  console.error('❌  ' + msg);
   process.exit(1);
 }
 
-// ── Shared state ───────────────────────────────────────────────────────────────
+// ── Session store ──────────────────────────────────────────────────────────────
+// Maps chatId → { channelId, username, lastMsgTs, typingMessage, typingTimeout }
+// Also maps channelId → chatId for reverse lookup
 
-const store = new SessionStore();
+const byChatId    = new Map();
+const byChannelId = new Map();
+
+function storeAdd(chatId, channelId, username) {
+  byChatId.set(chatId, { channelId, username, lastMsgTs: 0, typingMessage: null, typingTimeout: null });
+  byChannelId.set(channelId, chatId);
+}
+
+function storeGet(chatId)       { return byChatId.get(chatId); }
+function storeHas(chatId)       { return byChatId.has(chatId); }
+
+function storeGetByChannel(channelId) {
+  const chatId = byChannelId.get(channelId);
+  if (!chatId) return null;
+  const entry = byChatId.get(chatId);
+  if (!entry) return null;
+  return { chatId, entry };
+}
+
+function storeRemove(chatId) {
+  const e = byChatId.get(chatId);
+  if (!e) return;
+  if (e.typingTimeout) clearTimeout(e.typingTimeout);
+  byChannelId.delete(e.channelId);
+  byChatId.delete(chatId);
+}
+
+function resetTypingTimeout(chatId, newTimeout) {
+  const e = byChatId.get(chatId);
+  if (!e) return;
+  if (e.typingTimeout) clearTimeout(e.typingTimeout);
+  e.typingTimeout = newTimeout;
+}
+
+// ── API helpers ────────────────────────────────────────────────────────────────
+
+function authHeader() {
+  return { Authorization: `Bearer ${ADMIN_TOKEN}` };
+}
+
+async function getSessions(status) {
+  try {
+    const res = await fetch(`${WORKER}/chat/sessions?status=${status}&limit=40`, { headers: authHeader() });
+    if (!res.ok) return [];
+    const data = await res.json();
+    return data.sessions || [];
+  } catch { return []; }
+}
+
+async function getQueue() {
+  try {
+    const res = await fetch(`${WORKER}/chat/queue`, { headers: authHeader() });
+    if (!res.ok) return [];
+    const data = await res.json();
+    return data.queue || [];
+  } catch { return []; }
+}
+
+async function getMessages(chatId, since) {
+  try {
+    const res = await fetch(`${WORKER}/chat/session/${chatId}/messages?since=${since}`, { headers: authHeader() });
+    if (!res.ok) return [];
+    const data = await res.json();
+    return data.messages || [];
+  } catch { return []; }
+}
+
+async function sendReply(chatId, body) {
+  try {
+    const res = await fetch(`${WORKER}/chat/session/${chatId}/reply`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeader() },
+      body: JSON.stringify({ body, agentName: AGENT_NAME }),
+    });
+    return res.ok;
+  } catch { return false; }
+}
+
+async function sendTyping(chatId) {
+  try {
+    await fetch(`${WORKER}/chat/session/${chatId}/typing`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeader() },
+    });
+  } catch { /* swallow */ }
+}
+
+async function markRead(chatId) {
+  try {
+    await fetch(`${WORKER}/chat/session/${chatId}/read`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeader() },
+    });
+  } catch { /* swallow */ }
+}
+
+async function closeSession(chatId) {
+  try {
+    const res = await fetch(`${WORKER}/chat/session/${chatId}/close`, {
+      method: 'DELETE',
+      headers: authHeader(),
+    });
+    return res.ok;
+  } catch { return false; }
+}
+
+function resolveId(session) {
+  return session.chatId || session.sessionId || session.id || null;
+}
 
 // ── Discord client ─────────────────────────────────────────────────────────────
 
@@ -45,118 +146,94 @@ const client = new Client({
 
 // ── Channel helpers ────────────────────────────────────────────────────────────
 
-/** Turn a username into a valid Discord channel name */
-function channelName(username: string, chatId: string): string {
+function safeChannelName(username, chatId) {
   const safe = username.toLowerCase().replace(/[^a-z0-9]/g, '-').replace(/-+/g, '-').slice(0, 60);
   return `support-${safe}-${chatId.slice(0, 6)}`;
 }
 
-/**
- * Find or create the Discord channel for a session.
- * The channel's topic always contains `Session: <chatId>` so we can
- * re-discover it after a bot restart.
- */
-async function getOrCreateChannel(
-  chatId: string,
-  username: string,
-  pusher: Pusher,
-): Promise<TextChannel | null> {
+function esc(text) {
+  return String(text).replace(/[*_`~\\]/g, '\\$&');
+}
+
+async function getOrCreateChannel(chatId, username, pusher) {
   const guild = client.guilds.cache.get(GUILD_ID);
   if (!guild) { console.error('Guild not found:', GUILD_ID); return null; }
 
-  // Look for an existing channel with this chatId in the topic
+  // Try to find an existing channel from a previous run (topic contains the chatId)
   const existing = guild.channels.cache.find(
-    (ch): ch is TextChannel =>
-      ch.type === ChannelType.GuildText &&
-      (ch as TextChannel).parentId === CATEGORY_ID &&
-      !!((ch as TextChannel).topic?.includes(`Session: ${chatId}`)),
+    ch => ch.type === ChannelType.GuildText &&
+          ch.parentId === CATEGORY_ID &&
+          ch.topic?.includes(`Session: ${chatId}`)
   );
 
   if (existing) {
-    if (!store.has(chatId)) {
-      store.add(chatId, existing.id, username);
+    if (!storeHas(chatId)) {
+      storeAdd(chatId, existing.id, username);
       subscribeToSession(pusher, chatId);
     }
     return existing;
   }
 
-  // Create a fresh channel
+  // Create a new channel
   try {
     const ch = await guild.channels.create({
-      name: channelName(username, chatId),
+      name: safeChannelName(username, chatId),
       type: ChannelType.GuildText,
       parent: CATEGORY_ID,
       topic: `Live support | User: ${username} | Session: ${chatId}`,
     });
-    store.add(chatId, ch.id, username);
+    storeAdd(chatId, ch.id, username);
     subscribeToSession(pusher, chatId);
-    console.log(`📢  Created channel #${ch.name} for session ${chatId}`);
-    return ch as TextChannel;
+    console.log(`📢  Created #${ch.name} for session ${chatId}`);
+    return ch;
   } catch (e) {
-    console.error('Failed to create Discord channel:', e);
+    console.error('Failed to create channel:', e);
     return null;
   }
 }
 
 // ── Message helpers ────────────────────────────────────────────────────────────
 
-/**
- * Post a user message in the support channel.
- * If there's a pending "typing…" placeholder, edit it instead of sending a new message.
- */
-async function postUserMessage(chatId: string, msg: api.ChatMessage): Promise<void> {
-  const entry = store.get(chatId);
+async function postUserMessage(chatId, msg) {
+  const entry = storeGet(chatId);
   if (!entry) return;
 
-  const ch = client.channels.cache.get(entry.channelId) as TextChannel | undefined;
+  const ch = client.channels.cache.get(entry.channelId);
   if (!ch) return;
 
   const sender  = msg.sender || entry.username || 'User';
-  const content = `**${escapeMarkdown(sender)}:** ${msg.body}`;
+  const content = `**${esc(sender)}:** ${msg.body}`;
 
+  // If there's a "typing…" placeholder, edit it to show the real message
   if (entry.typingMessage) {
     const placeholder = entry.typingMessage;
-    // Clear the placeholder state BEFORE awaiting anything to avoid double-edits
-    store.setTypingMessage(chatId, null);
-    store.resetTypingTimeout(chatId, null);
+    entry.typingMessage = null;
+    resetTypingTimeout(chatId, null);
     try {
       await placeholder.edit(content);
       return;
-    } catch {
-      // Placeholder may have been deleted; fall through and send a new message
-    }
+    } catch { /* placeholder gone, fall through */ }
   }
 
   await ch.send(content).catch(console.error);
 }
 
-/** Escape Discord markdown characters in user-supplied names */
-function escapeMarkdown(text: string): string {
-  return text.replace(/[*_`~\\]/g, '\\$&');
-}
-
-/**
- * Pull all messages we haven't seen yet and post them to Discord.
- */
-async function syncNewMessages(chatId: string): Promise<void> {
-  const entry = store.get(chatId);
+async function syncNewMessages(chatId) {
+  const entry = storeGet(chatId);
   if (!entry) return;
 
-  const messages = await api.getMessages(chatId, entry.lastMsgTs, ADMIN_TOKEN);
+  const messages = await getMessages(chatId, entry.lastMsgTs);
   for (const msg of messages) {
-    // Only forward user messages — agent messages are what WE sent
     if (msg.role === 'user') {
       await postUserMessage(chatId, msg);
     }
-    if (msg.ts > entry.lastMsgTs) {
-      store.setLastMsgTs(chatId, msg.ts);
-    }
+    if (msg.ts > entry.lastMsgTs) entry.lastMsgTs = msg.ts;
   }
 }
 
 // ── Per-session Pusher subscription ───────────────────────────────────────────
 
-function subscribeToSession(pusher: Pusher, chatId: string): void {
+function subscribeToSession(pusher, chatId) {
   const ch = pusher.subscribe(`xtero-session-${chatId}`);
 
   ch.bind('new-message', () => {
@@ -164,211 +241,161 @@ function subscribeToSession(pusher: Pusher, chatId: string): void {
   });
 
   ch.bind('session-closed', async () => {
-    const entry = store.get(chatId);
+    const entry = storeGet(chatId);
     if (!entry) return;
-    const channel = client.channels.cache.get(entry.channelId) as TextChannel | undefined;
+    const channel = client.channels.cache.get(entry.channelId);
     if (channel) {
-      await channel
-        .send(
-          '🔴 **Session closed.** The user has left this support session.\n' +
-          'You can type `!close` to archive this channel or just leave it as a record.',
-        )
-        .catch(console.error);
+      await channel.send('🔴 **Session closed.** The user has left this support session.\nType `!close` to tidy up this channel, or leave it as a record.').catch(console.error);
     }
   });
 }
 
-// ── Global Pusher subscription ─────────────────────────────────────────────────
+// ── Global Pusher + admin channel ─────────────────────────────────────────────
 
-function initPusher(): Pusher {
-  // Suppress Pusher's verbose logging
+function initPusher() {
   Pusher.logToConsole = false;
 
   const pusher = new Pusher(PUSHER_KEY, { cluster: PUSHER_CLUSTER });
 
-  const adminChannel = pusher.subscribe('xtero-admin');
+  const adminCh = pusher.subscribe('xtero-admin');
 
-  // A new live support session was created or the queue changed
-  adminChannel.bind('new-session',     () => refreshSessions(pusher));
-  adminChannel.bind('session-updated', () => refreshSessions(pusher));
-  adminChannel.bind('queue-updated',   () => refreshSessions(pusher));
+  adminCh.bind('new-session',     () => refreshSessions(pusher));
+  adminCh.bind('session-updated', () => refreshSessions(pusher));
+  adminCh.bind('queue-updated',   () => refreshSessions(pusher));
 
-  // User started typing — show a placeholder in the Discord channel
-  adminChannel.bind('user-typing', async (data: { sessionId?: string }) => {
+  // User started typing → show a placeholder in the Discord channel
+  adminCh.bind('user-typing', async (data) => {
     const chatId = data?.sessionId;
     if (!chatId) return;
 
-    const entry = store.get(chatId);
+    const entry = storeGet(chatId);
     if (!entry) return;
 
-    const channel = client.channels.cache.get(entry.channelId) as TextChannel | undefined;
+    const channel = client.channels.cache.get(entry.channelId);
     if (!channel) return;
 
-    // Reset the auto-delete timeout every time a typing event arrives
-    store.resetTypingTimeout(
-      chatId,
-      setTimeout(async () => {
-        // User stopped typing without sending — remove the placeholder
-        const e = store.get(chatId);
-        if (e?.typingMessage) {
-          try { await e.typingMessage.delete(); } catch { /* already gone */ }
-          store.setTypingMessage(chatId, null);
-        }
-      }, 5_000),
-    );
+    // Reset the 5-second auto-delete timer each time a typing event arrives
+    resetTypingTimeout(chatId, setTimeout(async () => {
+      const e = storeGet(chatId);
+      if (e?.typingMessage) {
+        try { await e.typingMessage.delete(); } catch { /* already gone */ }
+        e.typingMessage = null;
+      }
+    }, 5000));
 
-    // If a placeholder is already showing, don't send another
+    // Don't stack multiple placeholders
     if (entry.typingMessage) return;
 
     try {
-      const placeholder = await channel.send(
-        `✏️ **${escapeMarkdown(entry.username)}** is typing…`,
-      );
-      store.setTypingMessage(chatId, placeholder);
+      const msg = await channel.send(`✏️ **${esc(entry.username)}** is typing…`);
+      entry.typingMessage = msg;
     } catch (e) {
       console.error('Failed to send typing placeholder:', e);
     }
   });
 
-  pusher.connection.bind('error',      (err: unknown) => console.error('Pusher error:', err));
-  pusher.connection.bind('disconnected', () => console.warn('⚠️  Pusher disconnected'));
   pusher.connection.bind('connected',    () => console.log('✅  Pusher connected'));
+  pusher.connection.bind('disconnected', () => console.warn('⚠️  Pusher disconnected'));
+  pusher.connection.bind('error',        (e) => console.error('Pusher error:', e));
 
   return pusher;
 }
 
-/**
- * Fetch the current queue + open sessions.
- * For any session we haven't seen yet, create a Discord channel and announce it.
- */
-async function refreshSessions(pusher: Pusher): Promise<void> {
-  const [queued, open] = await Promise.all([
-    api.getQueue(ADMIN_TOKEN),
-    api.getSessions('open', ADMIN_TOKEN),
-  ]);
+// ── Refresh sessions ───────────────────────────────────────────────────────────
 
+async function refreshSessions(pusher) {
+  const [queued, open] = await Promise.all([getQueue(), getSessions('open')]);
   const all = [...queued, ...open];
 
   for (const session of all) {
-    const chatId = api.resolveId(session);
-    if (!chatId) continue;
-    if (store.has(chatId)) continue; // already tracking
+    const chatId = resolveId(session);
+    if (!chatId || storeHas(chatId)) continue;
 
     const channel = await getOrCreateChannel(chatId, session.username || 'Unknown', pusher);
     if (!channel) continue;
 
     const statusEmoji = session.status === 'queued' ? '🟡' : '🟢';
+    await channel.send(
+      `${statusEmoji} **New live support session** from **${esc(session.username || 'Unknown')}**\n` +
+      `Status: \`${session.status}\`  |  Session ID: \`${chatId}\`\n\n` +
+      `**How to use:**\n` +
+      `• Type here → message is sent to the user\n` +
+      `• User typing → you'll see a placeholder that edits to their message\n` +
+      `• Type \`!close\` to close the session`
+    ).catch(console.error);
 
-    // Announce the session and explain how to use the channel
-    await channel
-      .send(
-        `${statusEmoji} **New live support session** from **${escapeMarkdown(session.username || 'Unknown')}**\n` +
-        `Status: \`${session.status}\`  |  Session ID: \`${chatId}\`\n\n` +
-        `**How to use this channel:**\n` +
-        `• Type a message here → it gets sent directly to the user\n` +
-        `• When the user types, you'll see a "typing…" placeholder that auto-edits to their message\n` +
-        `• Type \`!close\` to close the session\n`,
-      )
-      .catch(console.error);
-
-    // Load any messages that arrived before the bot was watching
     await syncNewMessages(chatId);
-    await api.markRead(chatId, ADMIN_TOKEN);
+    await markRead(chatId);
   }
 }
 
-/**
- * On startup, scan the support category for channels that were created in a
- * previous run so we don't duplicate them after a bot restart.
- */
-async function recoverExistingChannels(pusher: Pusher): Promise<void> {
+// ── Recover channels from a previous bot run ───────────────────────────────────
+
+async function recoverExistingChannels(pusher) {
   const guild = client.guilds.cache.get(GUILD_ID);
   if (!guild) return;
 
   for (const [, ch] of guild.channels.cache) {
-    if (ch.type !== ChannelType.GuildText) continue;
-    const textCh = ch as TextChannel;
-    if (textCh.parentId !== CATEGORY_ID) continue;
-
-    const topic = textCh.topic ?? '';
+    if (ch.type !== ChannelType.GuildText || ch.parentId !== CATEGORY_ID) continue;
+    const topic = ch.topic || '';
     const match = topic.match(/Session: ([a-zA-Z0-9_-]+)/);
     if (!match) continue;
-
     const chatId = match[1];
-    if (store.has(chatId)) continue;
-
+    if (storeHas(chatId)) continue;
     const usernameMatch = topic.match(/User: ([^|]+)/);
     const username = usernameMatch ? usernameMatch[1].trim() : 'Unknown';
-
-    store.add(chatId, ch.id, username);
+    storeAdd(chatId, ch.id, username);
     subscribeToSession(pusher, chatId);
-    console.log(`♻️   Recovered session ${chatId} → #${textCh.name}`);
+    console.log(`♻️   Recovered session ${chatId} → #${ch.name}`);
   }
 }
 
 // ── Discord events ─────────────────────────────────────────────────────────────
 
 client.on('messageCreate', async (message) => {
-  // Ignore bot messages (including our own)
   if (message.author.bot) return;
   if (!message.guild) return;
 
-  const session = store.getByChannelId(message.channelId);
-  if (!session) return; // Not a support channel
+  const session = storeGetByChannel(message.channelId);
+  if (!session) return;
 
-  const { chatId, entry } = session;
+  const { chatId } = session;
 
-  // ── Special commands ──────────────────────────────────────────
   if (message.content.trim() === '!close') {
-    const ok = await api.closeSession(chatId, ADMIN_TOKEN);
+    const ok = await closeSession(chatId);
     if (ok) {
-      await message.reply('✅ Session closed. User has been notified.').catch(console.error);
-      store.remove(chatId);
+      await message.reply('✅ Session closed.').catch(console.error);
+      storeRemove(chatId);
     } else {
-      await message.reply('❌ Failed to close session via API.').catch(console.error);
+      await message.reply('❌ Failed to close session — it may already be closed.').catch(console.error);
     }
     return;
   }
 
-  // ── Forward message to user ───────────────────────────────────
-  const ok = await api.sendReply(chatId, message.content, AGENT_NAME, ADMIN_TOKEN);
+  const ok = await sendReply(chatId, message.content);
   if (!ok) {
-    await message
-      .reply('❌ Failed to deliver your message. The session may have already been closed.')
-      .catch(console.error);
+    await message.reply('❌ Failed to deliver — the session may have ended.').catch(console.error);
   }
 });
 
 client.on('typingStart', async (typing) => {
-  // Ignore bots (typing.user may be a partial; bot property is always present)
   if (typing.user.bot) return;
-
-  const session = store.getByChannelId(typing.channel.id);
+  const session = storeGetByChannel(typing.channel.id);
   if (!session) return;
-
-  // Tell the Xtero API that the agent is typing so the user sees the indicator
-  await api.sendTyping(session.chatId, ADMIN_TOKEN);
+  await sendTyping(session.chatId);
 });
 
 // ── Ready ──────────────────────────────────────────────────────────────────────
 
 client.once('ready', async () => {
   console.log(`✅  Logged in as ${client.user?.tag}`);
-
   const pusher = initPusher();
-
-  // Re-register channels from a previous run first
   await recoverExistingChannels(pusher);
-
-  // Then pull any currently open/queued sessions
   await refreshSessions(pusher);
-
-  console.log('🚀  Bot is ready and listening for support sessions!');
+  console.log('🚀  Bot ready!');
 });
 
-// ── Start ──────────────────────────────────────────────────────────────────────
-
 client.login(DISCORD_TOKEN).catch((e) => {
-  console.error('❌  Could not log in to Discord:', e);
+  console.error('❌  Discord login failed:', e);
   process.exit(1);
 });
