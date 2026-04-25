@@ -1,6 +1,7 @@
 require('dotenv/config');
 const { Client, GatewayIntentBits, ChannelType, Partials } = require('discord.js');
-const Pusher = require('pusher-js');
+const PusherLib = require('pusher-js');
+const Pusher = PusherLib.default || PusherLib;
 
 // ── Config ─────────────────────────────────────────────────────────────────────
 
@@ -112,7 +113,7 @@ async function sendTyping(chatId) {
 async function markRead(chatId) {
   try {
     await fetch(`${WORKER}/chat/session/${chatId}/read`, {
-      method: 'POST',
+      method: 'PATCH',
       headers: { 'Content-Type': 'application/json', ...authHeader() },
     });
   } catch { /* swallow */ }
@@ -120,7 +121,7 @@ async function markRead(chatId) {
 
 async function closeSession(chatId) {
   try {
-    const res = await fetch(`${WORKER}/chat/session/${chatId}/close`, {
+    const res = await fetch(`${WORKER}/chat/session/${chatId}`, {
       method: 'DELETE',
       headers: authHeader(),
     });
@@ -314,7 +315,7 @@ async function refreshSessions(pusher) {
     const channel = await getOrCreateChannel(chatId, session.username || 'Unknown', pusher);
     if (!channel) continue;
 
-    const statusEmoji = session.status === 'queued' ? '🟡' : '🟢';
+    const statusEmoji = (session.status === 'queued' || !session.status) ? '🟡' : '🟢';
     await channel.send(
       `${statusEmoji} **New live support session** from **${esc(session.username || 'Unknown')}**\n` +
       `Status: \`${session.status}\`  |  Session ID: \`${chatId}\`\n\n` +
